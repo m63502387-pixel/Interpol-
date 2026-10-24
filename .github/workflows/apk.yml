@@ -1,0 +1,98 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      godot: ${{ steps.v.outputs.godot }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Распаковка project.zip (если загружен)
+        run: |
+          set -e
+          if [ -f project.zip ]; then
+            rm -rf /tmp/unz && mkdir /tmp/unz
+            unzip -q project.zip -d /tmp/unz
+            PG=$(find /tmp/unz -name project.godot | awk '{ print length, $0 }' | sort -n | head -1 | cut -d' ' -f2-)
+            [ -n "$PG" ] || { echo "В project.zip нет project.godot"; exit 1; }
+            rsync -a --exclude '.git/' --exclude '.godot/' "$(dirname "$PG")"/ ./
+            rm -f project.zip
+            [ -f .gitignore ] || printf '.godot/\n*.apk\n' > .gitignore
+            git config user.name "github-actions"
+            git config user.email "actions@users.noreply.github.com"
+            git add -A
+            git commit -m "Распаковка project.zip" || true
+            git push
+          fi
+
+      - name: Версия Godot
+        id: v
+        run: |
+          [ -f project.godot ] || { echo "В репозитории нет project.godot"; exit 1; }
+          V=$(grep -o 'PackedStringArray("[0-9]*\.[0-9]*"' project.godot | head -1 | grep -o '[0-9]*\.[0-9]*' || true)
+          case "$V" in
+            4.2) G=4.2.2 ;;
+            4.4) G=4.4.1 ;;
+            4.5) G=4.5.2 ;;
+            4.6) G=4.6.3 ;;
+            4.7) G=4.7.2 ;;
+            *) G=4.3 ;;
+          esac
+          echo "godot=$G" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    container:
+      image: barichello/godot-ci:${{ needs.prepare.outputs.godot }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Подготовка Godot
+        run: |
+          mkdir -p ~/.local/share/godot/export_templates ~/.config/godot
+          if [ "$HOME" != "/root" ]; then
+            cp -r /root/.local/share/godot/export_templates/. ~/.local/share/godot/export_templates/
+            cp -r /root/.config/godot/. ~/.config/godot/
+          fi
+
+      - name: Сборка APK
+        run: |
+          [ -f export_presets.cfg ] || { echo "Нет export_presets.cfg"; exit 1; }
+          mkdir -p build
+          godot --headless --verbose --editor --quit || true
+          godot --headless --verbose --export-debug "Android Debug" "$GITHUB_WORKSPACE/build/app.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk
+          path: build/app.apk
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: apk
+          path: out
+      - name: Публикация APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: APK ${{ github.run_number }}
+          files: out/app.apk
+       
